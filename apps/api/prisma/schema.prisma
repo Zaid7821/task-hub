@@ -1,0 +1,464 @@
+// AIonOS Work Tracker — database schema.
+// Conventions: UUIDv7 primary keys, snake_case tables/columns via @map, timestamptz everywhere.
+// Enums are mirrored in packages/shared/src/enums.ts (checked at compile time).
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum SystemRole {
+  SUPER_ADMIN
+  DEPARTMENT_HEAD
+  MANAGER
+  EMPLOYEE
+  VIEWER
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum ProjectVisibility {
+  PUBLIC
+  DEPARTMENT
+  PRIVATE
+}
+
+enum ProjectMemberRole {
+  OWNER
+  MEMBER
+  VIEWER
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TaskType {
+  TASK
+  BUG
+  REQUEST
+}
+
+/// Fixed palette so label colours always map to theme tokens.
+enum LabelColor {
+  GRAY
+  RED
+  ORANGE
+  YELLOW
+  GREEN
+  TEAL
+  BLUE
+  PURPLE
+  PINK
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  MENTIONED
+  COMMENT_ADDED
+  STATUS_CHANGED
+  TIMESHEET_SUBMITTED
+  TIMESHEET_APPROVED
+  TIMESHEET_REJECTED
+}
+
+enum TimesheetStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+// ─── Organization ───────────────────────────────────────────────────────────
+
+model Department {
+  id                 String   @id @default(uuid(7)) @db.Uuid
+  name               String   @unique @db.VarChar(120)
+  headId             String?  @map("head_id") @db.Uuid
+  parentDepartmentId String?  @map("parent_department_id") @db.Uuid
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  head             User?        @relation("DepartmentHead", fields: [headId], references: [id], onDelete: SetNull)
+  parentDepartment Department?  @relation("DepartmentHierarchy", fields: [parentDepartmentId], references: [id], onDelete: SetNull)
+  childDepartments Department[] @relation("DepartmentHierarchy")
+  teams            Team[]
+  users            User[]       @relation("DepartmentMembers")
+  projects         Project[]
+
+  @@index([parentDepartmentId])
+  @@index([headId])
+  @@map("departments")
+}
+
+model Team {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  name         String   @db.VarChar(120)
+  departmentId String   @map("department_id") @db.Uuid
+  leadId       String?  @map("lead_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  lead       User?      @relation("TeamLead", fields: [leadId], references: [id], onDelete: SetNull)
+  members    User[]     @relation("TeamMembers")
+
+  @@unique([departmentId, name])
+  @@index([leadId])
+  @@map("teams")
+}
+
+model User {
+  id            String     @id @default(uuid(7)) @db.Uuid
+  /// Entra ID object id ("oid" claim). Stable identity key for SSO and Graph sync.
+  entraObjectId String     @unique @map("entra_object_id") @db.Uuid
+  /// Always stored lower-case.
+  email         String     @unique @db.VarChar(320)
+  displayName   String     @map("display_name") @db.VarChar(200)
+  jobTitle      String?    @map("job_title") @db.VarChar(200)
+  employeeCode  String?    @unique @map("employee_code") @db.VarChar(50)
+  departmentId  String?    @map("department_id") @db.Uuid
+  teamId        String?    @map("team_id") @db.Uuid
+  managerId     String?    @map("manager_id") @db.Uuid
+  systemRole    SystemRole @default(EMPLOYEE) @map("system_role")
+  isActive      Boolean    @default(true) @map("is_active")
+  lastSyncedAt  DateTime?  @map("last_synced_at") @db.Timestamptz(3)
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  department    Department? @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
+  team          Team?       @relation("TeamMembers", fields: [teamId], references: [id], onDelete: SetNull)
+  manager       User?       @relation("ManagerReports", fields: [managerId], references: [id], onDelete: SetNull)
+  directReports User[]      @relation("ManagerReports")
+
+  headOfDepartments  Department[]    @relation("DepartmentHead")
+  leadOfTeams        Team[]          @relation("TeamLead")
+  ownedProjects      Project[]       @relation("ProjectOwner")
+  projectMemberships ProjectMember[]
+  assignedTasks      Task[]          @relation("TaskAssignee")
+  reportedTasks      Task[]          @relation("TaskReporter")
+  timeLogs           TimeLog[]
+  comments           Comment[]
+  taskActivities     TaskActivity[]
+  auditLogs          AuditLog[]
+  checklistDone      ChecklistItem[] @relation("ChecklistDoneBy")
+  savedViews         SavedView[]
+  notifications      Notification[]  @relation("NotificationRecipient")
+  notificationsSent  Notification[]  @relation("NotificationActor")
+  timesheetWeeks     TimesheetWeek[] @relation("TimesheetOwner")
+  timesheetApprovals TimesheetWeek[] @relation("TimesheetApprover")
+
+  @@index([departmentId])
+  @@index([teamId])
+  @@index([managerId])
+  @@index([isActive])
+  @@map("users")
+}
+
+// ─── Projects ───────────────────────────────────────────────────────────────
+
+/// Deletion policy: archive (status = ARCHIVED) is the normal path. Tasks, time logs, comments
+/// and activity are contribution history, so their FKs are Restrict: a project or task that has
+/// history cannot be hard-deleted. Hard delete is SUPER_ADMIN-only (enforced in the API).
+model Project {
+  id           String            @id @default(uuid(7)) @db.Uuid
+  /// Short upper-case code used in task numbers, e.g. "HRP" -> HRP-12.
+  key          String            @unique @db.VarChar(10)
+  name         String            @db.VarChar(200)
+  description  String?           @db.Text
+  ownerId      String            @map("owner_id") @db.Uuid
+  departmentId String            @map("department_id") @db.Uuid
+  status       ProjectStatus     @default(ACTIVE)
+  visibility   ProjectVisibility @default(DEPARTMENT)
+  startDate    DateTime?         @map("start_date") @db.Date
+  endDate      DateTime?         @map("end_date") @db.Date
+  /// Last issued task number. Incremented atomically when a task is created.
+  taskCounter  Int               @default(0) @map("task_counter")
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  owner      User            @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  department Department      @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  members    ProjectMember[]
+  labels     Label[]
+  tasks      Task[]
+
+  @@index([departmentId])
+  @@index([ownerId])
+  @@index([status])
+  @@map("projects")
+}
+
+model ProjectMember {
+  projectId String            @map("project_id") @db.Uuid
+  userId    String            @map("user_id") @db.Uuid
+  role      ProjectMemberRole @default(MEMBER)
+  createdAt DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@index([userId])
+  @@map("project_members")
+}
+
+// ─── Tasks ──────────────────────────────────────────────────────────────────
+
+model Task {
+  id             String       @id @default(uuid(7)) @db.Uuid
+  projectId      String       @map("project_id") @db.Uuid
+  /// Sequential per project; display as `${project.key}-${taskNumber}`.
+  taskNumber     Int          @map("task_number")
+  title          String       @db.VarChar(255)
+  description    String?      @db.Text
+  type           TaskType     @default(TASK)
+  status         TaskStatus   @default(TODO)
+  priority       TaskPriority @default(MEDIUM)
+  assigneeId     String?      @map("assignee_id") @db.Uuid
+  reporterId     String       @map("reporter_id") @db.Uuid
+  estimatePoints Int?         @map("estimate_points")
+  estimateHours  Decimal?     @map("estimate_hours") @db.Decimal(6, 2)
+  dueDate        DateTime?    @map("due_date") @db.Date
+  startedAt      DateTime?    @map("started_at") @db.Timestamptz(3)
+  completedAt    DateTime?    @map("completed_at") @db.Timestamptz(3)
+  /// Sort order within a Kanban column (lower first). Leave gaps so items can be inserted between.
+  position       Float        @default(0)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project       Project         @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  assignee      User?           @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  reporter      User            @relation("TaskReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  timeLogs      TimeLog[]
+  comments      Comment[]
+  activities    TaskActivity[]
+  labels        TaskLabel[]
+  checklist     ChecklistItem[]
+  notifications Notification[]
+
+  @@unique([projectId, taskNumber])
+  @@index([projectId, status])
+  @@index([assigneeId, status])
+  @@index([reporterId])
+  @@index([dueDate])
+  @@map("tasks")
+}
+
+model TimeLog {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  taskId    String   @map("task_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  hours     Decimal  @db.Decimal(5, 2)
+  workDate  DateTime @map("work_date") @db.Date
+  note      String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, workDate])
+  @@index([taskId])
+  @@map("time_logs")
+}
+
+model Comment {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  taskId    String    @map("task_id") @db.Uuid
+  authorId  String    @map("author_id") @db.Uuid
+  body      String    @db.Text
+  editedAt  DateTime? @map("edited_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  author User @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@index([taskId, createdAt])
+  @@index([authorId])
+  @@map("comments")
+}
+
+// ─── Labels & checklists (task content, not contribution history) ───────────
+
+/// Per-project label. Created by project managers, applied by anyone who can edit tasks.
+model Label {
+  id        String     @id @default(uuid(7)) @db.Uuid
+  projectId String     @map("project_id") @db.Uuid
+  name      String     @db.VarChar(40)
+  color     LabelColor @default(GRAY)
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks   TaskLabel[]
+
+  @@unique([projectId, name])
+  @@map("labels")
+}
+
+model TaskLabel {
+  taskId    String   @map("task_id") @db.Uuid
+  labelId   String   @map("label_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  task  Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label Label @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, labelId])
+  @@index([labelId])
+  @@map("task_labels")
+}
+
+model ChecklistItem {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  taskId    String    @map("task_id") @db.Uuid
+  title     String    @db.VarChar(255)
+  isDone    Boolean   @default(false) @map("is_done")
+  doneAt    DateTime? @map("done_at") @db.Timestamptz(3)
+  doneById  String?   @map("done_by_id") @db.Uuid
+  /// Sort order within the task (lower first), with gaps like Task.position.
+  position  Float     @default(0)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  task   Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  doneBy User? @relation("ChecklistDoneBy", fields: [doneById], references: [id], onDelete: SetNull)
+
+  @@index([taskId, position])
+  @@map("checklist_items")
+}
+
+// ─── Personal: saved views & notifications ──────────────────────────────────
+
+/// A bookmarked list view: the page path plus its URL query (filters, sort).
+model SavedView {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String   @db.VarChar(80)
+  path      String   @db.VarChar(200)
+  query     String   @db.VarChar(1000)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("saved_views")
+}
+
+/// In-app notification. Email/Teams delivery is a later phase.
+model Notification {
+  id          String           @id @default(uuid(7)) @db.Uuid
+  userId      String           @map("user_id") @db.Uuid
+  type        NotificationType
+  actorId     String?          @map("actor_id") @db.Uuid
+  taskId      String?          @map("task_id") @db.Uuid
+  timesheetId String?          @map("timesheet_id") @db.Uuid
+  /// Small type-specific payload, e.g. { from, to } for STATUS_CHANGED or { excerpt } for comments.
+  data        Json?
+  readAt      DateTime?        @map("read_at") @db.Timestamptz(3)
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user      User           @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  actor     User?          @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  task      Task?          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  timesheet TimesheetWeek? @relation(fields: [timesheetId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+// ─── Timesheets ─────────────────────────────────────────────────────────────
+
+/// Approval state of one user's week (Mon-Sun). Hours come from TimeLog rows in that range;
+/// while SUBMITTED or APPROVED those time logs are locked.
+model TimesheetWeek {
+  id           String          @id @default(uuid(7)) @db.Uuid
+  userId       String          @map("user_id") @db.Uuid
+  /// Monday of the week.
+  weekStart    DateTime        @map("week_start") @db.Date
+  status       TimesheetStatus @default(DRAFT)
+  submittedAt  DateTime?       @map("submitted_at") @db.Timestamptz(3)
+  /// Manager at submission time (fallback: department head, then a SUPER_ADMIN).
+  approverId   String?         @map("approver_id") @db.Uuid
+  decidedAt    DateTime?       @map("decided_at") @db.Timestamptz(3)
+  decisionNote String?         @map("decision_note") @db.VarChar(1000)
+  createdAt    DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user          User           @relation("TimesheetOwner", fields: [userId], references: [id], onDelete: Restrict)
+  approver      User?          @relation("TimesheetApprover", fields: [approverId], references: [id], onDelete: SetNull)
+  notifications Notification[]
+
+  @@unique([userId, weekStart])
+  @@index([approverId, status])
+  @@map("timesheet_weeks")
+}
+
+// ─── Logs (append-only) ─────────────────────────────────────────────────────
+
+/// Per-task history shown in the UI. Written by TasksService/ActivityService only.
+model TaskActivity {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  taskId    String   @map("task_id") @db.Uuid
+  actorId   String   @map("actor_id") @db.Uuid
+  /// e.g. CREATED, STATUS_CHANGED, ASSIGNED
+  action    String   @db.VarChar(50)
+  field     String?  @db.VarChar(50)
+  oldValue  String?  @map("old_value") @db.Text
+  newValue  String?  @map("new_value") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  task  Task @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  actor User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([taskId, createdAt])
+  @@index([actorId])
+  @@map("task_activities")
+}
+
+/// System-wide security/compliance log for sensitive actions. Never updated or deleted by the app.
+model AuditLog {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  /// Null for system actions (e.g. Graph sync).
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String   @db.VarChar(80)
+  entityType String   @map("entity_type") @db.VarChar(50)
+  entityId   String?  @map("entity_id") @db.VarChar(64)
+  metadata   Json?
+  ipAddress  String?  @map("ip_address") @db.VarChar(45)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
