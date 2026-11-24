@@ -1,6 +1,6 @@
-# AIonOS Work Tracker
+# Work Tracker
 
-Internal project and task tracking for AIonOS (~500–600 employees across departments): projects,
+Internal project and task tracking for an organization of ~500–600 employees across departments: projects,
 Kanban boards, tasks, time logs, comments and contribution reporting. Sign-in is through
 Microsoft Entra ID (SSO).
 
@@ -138,9 +138,9 @@ Safety rails:
 
 ## Microsoft Entra ID setup (for IT)
 
-Two app registrations are needed in the AIonOS tenant.
+Two app registrations are needed in your organization's Entra tenant.
 
-### 1. API app registration ("AIonOS Work Tracker API")
+### 1. API app registration ("Work Tracker API")
 
 1. **Expose an API:** set the Application ID URI to `api://<api-client-id>` and add a delegated
    scope named `access_as_user` (admins and users can consent).
@@ -157,12 +157,12 @@ Two app registrations are needed in the AIonOS tenant.
 5. Put the tenant ID and the API's client ID into `apps/api/.env`
    (`ENTRA_TENANT_ID`, `ENTRA_API_CLIENT_ID`, `ENTRA_API_AUDIENCE`).
 
-### 2. SPA app registration ("AIonOS Work Tracker Web")
+### 2. SPA app registration ("Work Tracker Web")
 
 1. **Authentication → Add a platform → Single-page application.** Redirect URIs:
-   `http://localhost:5173` (local) plus each deployed URL (e.g. `https://tracker.aionos.ai`).
+   `http://localhost:5173` (local) plus each deployed URL (e.g. `https://tracker.example.com`).
    Use the same URLs as front-channel logout and post-logout redirect.
-2. **API permissions:** add the delegated permission _AIonOS Work Tracker API →
+2. **API permissions:** add the delegated permission _Work Tracker API →
    access_as_user_, and grant admin consent for the tenant.
 3. No client secret: SPAs are public clients and use PKCE.
 4. Put the values into `apps/web/.env`: `VITE_AUTH_MODE=entra`, `VITE_ENTRA_CLIENT_ID`
